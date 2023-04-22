@@ -1,4 +1,4 @@
-transformers
+transformers==4.21.0
 datasets
 sentencepiece != 0.1.92
 evaluate

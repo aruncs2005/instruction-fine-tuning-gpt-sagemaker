@@ -9,7 +9,7 @@ from transformers import (
     AutoTokenizer,
     default_data_collator,
     get_scheduler,
- 
+    AutoConfig
 )
 from itertools import chain
 import copy
@@ -22,6 +22,7 @@ import smdistributed.modelparallel.torch as smp
 
 from utils import is_main_process,main_process_first,wait_for_everyone
 from sharded_data_parallel_checkpoint import get_buffer_names,get_param_shapes
+
 
 @smp.step
 def train_step(model, batch):
@@ -145,12 +146,17 @@ def main():
     print(next(iter(train_dataloader)))
 
     # creating model
+    config = AutoConfig.from_pretrained(args.model_name_or_path)
+    config.hidden_act = "gelu"
 
     with smp.model_creation(
+        tensor_parallelism=True,
         dtype=torch.bfloat16,
         flash_attention=True
         ):
-        model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path,cache_dir="/tmp")
+            model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path,config=config,cache_dir=f"/tmp", torch_dtype=torch.bfloat16)
+
+    model = smp.DistributedModel(model, trace_device="gpu")
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
@@ -183,15 +189,13 @@ def main():
 
     
     # Prepare model and optimizer with Distributed variants.
-   
-    model = smp.DistributedModel(model, trace_device="gpu")
+  
+    transformer_layers = model.get_module().transformer.seq_layers
 
-    # this is specific to model for gpt-j 6b
-    transformer_layers = model.get_module().transformer.h
-    # below line has to uncommented for gpt_neox
-    #transformer_layers = model.get_module().gpt_neox.layers
     smp.set_activation_checkpointing(
     transformer_layers, pack_args_as_tuple=True, strategy='each')
+
+    wait_for_everyone()
 
     optimizer = smp.DistributedOptimizer(optimizer)
 
@@ -209,8 +213,7 @@ def main():
         model.train()
         total_loss = 0
         for step, batch in enumerate(tqdm(train_dataloader)):
-    
-            device = torch.device("cuda")
+            
             batch = {k: v.to(device) for k, v in batch.items()}
             loss = train_step(model,batch)
             total_loss += loss.reduce_mean().detach().float()
@@ -221,6 +224,7 @@ def main():
 
         train_epoch_loss = total_loss / len(train_dataloader)
         train_ppl = torch.exp(train_epoch_loss)
+
         if is_main_process(smp.rank()):
             print(f"{epoch=}: {train_ppl=} {train_epoch_loss=}")
 
@@ -242,23 +246,23 @@ def main():
         eval_epoch_loss = eval_loss / len(eval_dataloader)
         eval_ppl = torch.exp(eval_epoch_loss)
         if is_main_process(smp.rank()):
-            print(eval_preds)
             print(f"{epoch=}: {eval_ppl=} {eval_epoch_loss=}")
 
-    wait_for_everyone()
-    # save the checkpoint
-    user_content = {}
-    user_content["buffer_names"] = get_buffer_names(model)
-    user_content["param_shapes"] = get_param_shapes(model, optimizer)
+    # # save the checkpoint
+    # user_content = {}
+    # user_content["buffer_names"] = get_buffer_names(model)
+    # user_content["param_shapes"] = get_param_shapes(model, optimizer)
      
     smp.save_checkpoint(args.model_dir,
-                tag=f"gptneo20b_instruct_finetuning_1",
-                partial=True,
+                tag=f"gptneo20b_model.pt",
+                partial=False,
                 model=model,
-                optimizer=optimizer,
-                user_content=user_content)
-    print("saving the final model")
+                optimizer=optimizer)
     
+    print("saving the final model")
+
+    wait_for_everyone()
+
     if is_main_process(smp.rank()):
         tokenizer.save_pretrained(args.model_dir)
     wait_for_everyone()
